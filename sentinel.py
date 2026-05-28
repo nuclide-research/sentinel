@@ -856,21 +856,6 @@ def process_cve(cve: CVERecord, cfg: Config) -> Optional[SentinelFinding]:
         if len(corpus_hits) > 5:
             print(f"      {DIM(f'... and {len(corpus_hits)-5} more')}")
 
-    # Write P1/P2 corpus hits to pharos queue for autonomous follow-up
-    if corpus_hits and not cfg.dry_run:
-        from pathlib import Path as _Path
-        import json as _json
-        pharos_queue = cfg.state_dir / "pharos-queue.ndjson"
-        with open(pharos_queue, "a") as _f:
-            _f.write(_json.dumps({
-                "ip":       corpus_hits[0]["ip"],
-                "platform": matched_platforms[0] if matched_platforms else "unknown",
-                "version":  corpus_hits[0].get("version"),
-                "cve_id":   cve_id,
-                "cvss":     nvd.cvss_score,
-                "priority": "P2",
-            }) + "\n")
-
     # Priority scoring
     days_since = 0
     try:
@@ -882,6 +867,21 @@ def process_cve(cve: CVERecord, cfg: Config) -> Optional[SentinelFinding]:
     priority_score, priority_level = score_priority(nvd, poc_repos, cve.date_added)
     print(f"    CVSS {nvd.cvss_score} | PoC {'yes' if poc_repos else 'no'} | "
           f"score {priority_score:.3f} → {badge(priority_level)}")
+
+    # Write P1/P2 corpus hits to pharos queue for autonomous follow-up
+    if corpus_hits and priority_level in ("P1", "P2") and not cfg.dry_run:
+        from pathlib import Path as _Path
+        import json as _json
+        pharos_queue = cfg.state_dir / "pharos-queue.ndjson"
+        with open(pharos_queue, "a") as _f:
+            _f.write(_json.dumps({
+                "ip":       corpus_hits[0]["ip"],
+                "platform": matched_platforms[0] if matched_platforms else "unknown",
+                "version":  corpus_hits[0].get("version"),
+                "cve_id":   cve_id,
+                "cvss":     nvd.cvss_score,
+                "priority": priority_level,
+            }) + "\n")
 
     # Shodan exposure — use battle-tested dork catalog as primary source
     total_exposed = 0
