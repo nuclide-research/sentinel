@@ -48,7 +48,6 @@ try:
     from corpus_query import (
         load_corpus, query_by_version_range, corpus_stats,
         parse_dork_catalog, get_best_dork, get_cve_platform_map,
-        get_population_baselines,
     )
     _CORPUS_OK = True
 except ImportError:
@@ -58,7 +57,6 @@ except ImportError:
 _CORPUS: Optional[dict] = None
 _DORK_CATALOG: Optional[dict] = None
 _CVE_MAP: Optional[dict] = None
-_BASELINES: Optional[dict] = None
 
 def _get_corpus() -> dict:
     global _CORPUS
@@ -78,11 +76,16 @@ def _get_cve_map() -> dict:
         _CVE_MAP = get_cve_platform_map(_get_dork_catalog()) if _CORPUS_OK else {}
     return _CVE_MAP
 
-def _get_baselines() -> dict:
-    global _BASELINES
-    if _BASELINES is None:
-        _BASELINES = get_population_baselines(_get_dork_catalog()) if _CORPUS_OK else {}
-    return _BASELINES
+def _platform_baseline_count(platform_id: str) -> int:
+    """Return known baseline Shodan count for a platform from live baselines. 0 if unknown."""
+    if not _CORPUS_OK:
+        return 0
+    try:
+        from corpus_query import LIVE_BASELINES
+        entry = LIVE_BASELINES.get(platform_id)
+        return entry[0] if entry else 0
+    except Exception:
+        return 0
 
 # ─── ANSI colours ─────────────────────────────────────────────────────────────
 
@@ -116,13 +119,13 @@ PLATFORM_CPE = {
     "langsmith":  ["langsmith"],
     "llamacpp":   ["llama.cpp", "llama_cpp", "llamacpp", "ggerganov"],
     "milvus":     ["milvus", "zilliz"],
-    "mlflow":     ["mlflow", "databricks:mlflow"],
+    "mlflow":     ["mlflow", "databricks:mlflow", "mlflow:mlflow"],
     "n8n":        ["n8n"],
     "nvidia-nim": ["nvidia_nim", "nvidia nim", "nvidia:nim"],
     "ollama":     ["ollama"],
     "openvino-model-server": ["openvino", "ovms", "model_server"],
     "qdrant":     ["qdrant"],
-    "rayserve":   ["ray serve", "ray-serve", "anyscale"],
+    "rayserve":   ["ray serve", "ray-serve", "anyscale", "ray", "anyscale:ray", "ray-project:ray"],
     "sglang":     ["sglang"],
     "tgi":        ["text-generation-inference", "text_generation_inference"],
     "vllm":       ["vllm", "vllm-project"],
@@ -130,7 +133,7 @@ PLATFORM_CPE = {
     # Not in TOME but tracked by aimap / NuClide surveys:
     "langflow":   ["langflow"],
     "dify":       ["dify", "langgenius"],
-    "flowise":    ["flowise"],
+    "flowise":    ["flowise", "flowiseai:flowise", "flowise:flowise"],
     "open-webui": ["open-webui", "open_webui", "openwebui"],
     "litellm":    ["litellm", "berriai"],
     "temporal":   ["temporal", "temporalio"],
@@ -138,6 +141,11 @@ PLATFORM_CPE = {
     "grafana":    ["grafana"],
     "airflow":    ["apache:airflow", "airflow"],
     "elasticsearch": ["elasticsearch", "elastic:elasticsearch"],
+    # New entries from appendix-cve.md verified CVE table:
+    "anythingllm":   ["anythingllm", "mintplex-labs:anythingllm"],
+    "comfyui":       ["comfyui", "comfy-org:comfyui"],
+    "kubelet":       ["kubelet", "kubernetes:kubelet"],
+    "argo-workflows": ["argo-workflows", "argoproj:argo-workflows"],
 }
 
 # Fallback Shodan dorks for platforms not in TOME's catalog
@@ -152,6 +160,10 @@ PLATFORM_DORK_FALLBACK = {
     "grafana":       'http.title:"Grafana"',
     "airflow":       'http.title:"Airflow" | http.html:"Apache Airflow"',
     "elasticsearch": 'product:Elasticsearch | http.title:"Kibana"',
+    "anythingllm":   'http.title:"AnythingLLM" | http.html:"anythingllm" port:3001',
+    "comfyui":       'http.title:"ComfyUI" | http.html:"comfyui" port:8188',
+    "kubelet":       'port:10250 http.html:"kubelet"',
+    "argo-workflows": 'http.title:"Argo Workflows" | http.html:"argoproj.io" port:2746',
 }
 
 # ─── Config ───────────────────────────────────────────────────────────────────
@@ -752,16 +764,6 @@ def _platform_to_corpus(platform_id: str) -> Optional[str]:
     return _MAP.get(platform_id)
 
 
-def _platform_to_baseline_key(platform_id: str, baselines: dict) -> str:
-    """Find the best matching baseline key for a platform_id (fuzzy slug match)."""
-    if platform_id in baselines:
-        return platform_id
-    # Try contains match
-    for key in baselines:
-        if platform_id in key or key in platform_id:
-            return key
-    return platform_id
-
 
 def process_cve(cve: CVERecord, cfg: Config) -> Optional[SentinelFinding]:
     cve_id = cve.cve_id
@@ -844,7 +846,6 @@ def process_cve(cve: CVERecord, cfg: Config) -> Optional[SentinelFinding]:
     # Shodan exposure — use battle-tested dork catalog as primary source
     total_exposed = 0
     all_hosts: list[ExposedHost] = []
-    baselines = _get_baselines()
     total_baseline = 0
 
     for platform_id in matched_platforms:
@@ -853,9 +854,8 @@ def process_cve(cve: CVERecord, cfg: Config) -> Optional[SentinelFinding]:
         total_exposed += count
         all_hosts.extend(hosts)
 
-        # Anomaly detection vs April 2026 baseline
-        baseline_key = _platform_to_baseline_key(platform_id, baselines)
-        baseline = baselines.get(baseline_key, 0)
+        # Anomaly detection vs baseline (LIVE_BASELINES direct lookup)
+        baseline = _platform_baseline_count(platform_id)
         total_baseline += baseline
         anomaly_str = ""
         if baseline > 0 and count > 0:
