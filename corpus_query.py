@@ -488,3 +488,18 @@ if __name__ == "__main__":
             print(f"  {h['ip']:<16}  v{h['version']:<12}  {h['org']}")
         if len(hits) > 10:
             print(f"  ... and {len(hits)-10} more")
+
+
+# ─── Live baseline overrides (2026-05-28) ─────────────────────────────────────
+# Updated from Shodan UI manual run. Replaces April 2026 stale values.
+# Format: platform_id -> (count, date)
+LIVE_BASELINES: dict[str, tuple[int, str]] = {
+    "ollama":      (73498,  "2026-05-28"),
+    "open-webui":  (18984,  "2026-05-28"),
+    "n8n":         (162455, "2026-05-28"),
+    "chromadb":    (1765,   "2026-05-28"),
+    "qdrant":      (904,    "2026-05-28"),
+    "weaviate":    (1495,   "2026-05-28"),
+    "litellm":     (57454,  "2026-05-28"),
+    "langflow":    (5,      "2026-05-28"),
+}
