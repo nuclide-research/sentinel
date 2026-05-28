@@ -2,13 +2,15 @@
 corpus_query.py — NuClide OSINT corpus integration for sentinel.
 
 Three capabilities:
-  1. load_corpus()         — 493 surveyed AI/ML hosts with versions
+  1. load_corpus()         — multi-platform surveyed AI/ML hosts with versions
   2. query_by_version()    — find corpus hosts running a vulnerable version range
   3. parse_dork_catalog()  — 181+ battle-tested Shodan dorks with hit counts + CVE notes
 """
 
+import csv
 import json
 import re
+import sqlite3
 from pathlib import Path
 from typing import Optional
 
@@ -51,6 +53,196 @@ def load_corpus() -> dict[str, dict]:
         except Exception:
             continue
 
+    # SOURCE A — LLM gateway tier-2 hosts
+    _GATEWAY_CSV = (Path.home() / "AI-LLM-Infrastructure-OSINT" /
+                    "evidence" / "llm-gateway-tier2-2026-05-04" / "summary.csv")
+    _PLATFORM_MAP_A = {
+        "litellm":              "litellm",
+        "openai":               "openai-compat",
+        "openai-compat":        "openai-compat",
+        "ollama":               "ollama",
+        "lm studio":            "lm-studio",
+        "lmstudio":             "lm-studio",
+        "vllm":                 "vllm",
+        "llamacpp":             "llamacpp",
+        "llama.cpp":            "llamacpp",
+        "tgi":                  "tgi",
+        "mistral":              "mistral",
+        "langchain":            "langchain",
+        "dify":                 "dify",
+        "flowise":              "flowise",
+    }
+
+    if _GATEWAY_CSV.exists():
+        try:
+            with _GATEWAY_CSV.open(newline="", encoding="utf-8", errors="ignore") as fh:
+                reader = csv.DictReader(fh)
+                for row in reader:
+                    ip = (row.get("ip") or "").strip()
+                    if not ip:
+                        continue
+                    raw_platform = (row.get("platform") or "").strip()
+                    platform_id = "unknown"
+                    raw_lower = raw_platform.lower()
+                    for key, val in _PLATFORM_MAP_A.items():
+                        if key in raw_lower:
+                            platform_id = val
+                            break
+                    corpus[ip] = {
+                        "ip":        ip,
+                        "_platform": platform_id,
+                        "version":   (row.get("version") or "").strip(),
+                        "org":       (row.get("owned_by") or "").strip(),
+                        "_source":   "llm-gateway-tier2",
+                    }
+        except Exception:
+            pass
+
+    # SOURCE B — Arize Phoenix sweep
+    _PHOENIX_CSV = (Path.home() / "AI-LLM-Infrastructure-OSINT" /
+                    "evidence" / "2026-05-11-visorbishop-phase3" /
+                    "recon" / "phoenix-full-sweep.csv")
+
+    if _PHOENIX_CSV.exists():
+        try:
+            with _PHOENIX_CSV.open(newline="", encoding="utf-8", errors="ignore") as fh:
+                reader = csv.DictReader(fh)
+                for row in reader:
+                    target = (row.get("target") or "").strip()
+                    if not target:
+                        continue
+                    # Strip http:// / https:// and trailing :port
+                    ip = re.sub(r"^https?://", "", target)
+                    ip = ip.split(":")[0].split("/")[0]
+                    if not ip:
+                        continue
+                    corpus[ip] = {
+                        "ip":        ip,
+                        "_platform": "phoenix",
+                        "version":   (row.get("version") or "").strip(),
+                        "org":       "",
+                        "_source":   "phoenix-sweep",
+                    }
+        except Exception:
+            pass
+
+    # SOURCE C — Survey NDJSON files
+    _VER_EXTRACT = re.compile(r"([A-Za-z][\w\-\.]+)\s+v?(\d+\.\d+[\.\d]*)")
+    _PRODUCT_TO_PLATFORM = {
+        "weaviate":  "weaviate",
+        "n8n":       "n8n",
+        "langfuse":  "langfuse",
+        "langflow":  "langflow",
+        "langchain": "langchain",
+        "langgraph": "langgraph",
+        "ragflow":   "ragflow",
+        "dify":      "dify",
+        "flowise":   "flowise",
+        "chromadb":  "chromadb",
+        "qdrant":    "qdrant",
+        "milvus":    "milvus",
+        "mlflow":    "mlflow",
+        "grafana":   "grafana",
+        "jupyter":   "jupyter",
+        "vllm":      "vllm",
+        "ollama":    "ollama",
+        "phoenix":   "phoenix",
+        "litellm":   "litellm",
+        "temporal":  "temporal",
+        "airflow":   "airflow",
+    }
+
+    survey_root = Path.home() / "AI-LLM-Infrastructure-OSINT" / "working"
+    for ndjson_file in sorted(survey_root.glob("survey-*/survey-*-ingest.ndjson")):
+        try:
+            for line in ndjson_file.read_text(encoding="utf-8", errors="ignore").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                ip = rec.get("host.ip") or rec.get("host_ip") or ""
+                if not ip:
+                    ip = (rec.get("host") or {}).get("ip", "")
+                ip = ip.strip()
+                if not ip:
+                    continue
+                notes = rec.get("notes") or ""
+                m = _VER_EXTRACT.search(notes)
+                if not m:
+                    continue
+                product_raw = m.group(1).lower()
+                version = m.group(2)
+                platform_id = None
+                for key, val in _PRODUCT_TO_PLATFORM.items():
+                    if key in product_raw:
+                        platform_id = val
+                        break
+                if not platform_id:
+                    continue
+                corpus[ip] = {
+                    "ip":        ip,
+                    "_platform": platform_id,
+                    "version":   version,
+                    "org":       (rec.get("org") or {}).get("name", "") if isinstance(rec.get("org"), dict) else rec.get("org_name", ""),
+                    "_source":   "survey-ndjson:" + ndjson_file.parent.name,
+                }
+        except Exception:
+            continue
+
+    # SOURCE D — Visorlog SQLite
+    _VISORLOG_DB = Path.home() / "AI-LLM-Infrastructure-OSINT" / "visorlog.db"
+
+    if _VISORLOG_DB.exists():
+        try:
+            con = sqlite3.connect(str(_VISORLOG_DB))
+            rows = con.execute(
+                "SELECT host_ip, org_name, tags, notes FROM events WHERE host_ip IS NOT NULL"
+            ).fetchall()
+            con.close()
+            for host_ip, org_name, tags_json, notes in rows:
+                ip = (host_ip or "").strip()
+                if not ip:
+                    continue
+                notes = notes or ""
+                m = _VER_EXTRACT.search(notes)
+                if not m:
+                    continue
+                product_raw = m.group(1).lower()
+                version = m.group(2)
+                # Derive platform from tags first, then notes product match
+                platform_id = None
+                try:
+                    tags = json.loads(tags_json or "[]")
+                    for tag in tags:
+                        tl = tag.lower()
+                        for key, val in _PRODUCT_TO_PLATFORM.items():
+                            if key in tl:
+                                platform_id = val
+                                break
+                        if platform_id:
+                            break
+                except Exception:
+                    pass
+                if not platform_id:
+                    for key, val in _PRODUCT_TO_PLATFORM.items():
+                        if key in product_raw:
+                            platform_id = val
+                            break
+                if not platform_id:
+                    continue
+                corpus[ip] = {
+                    "ip":        ip,
+                    "_platform": platform_id,
+                    "version":   version,
+                    "org":       org_name or "",
+                    "_source":   "visorlog",
+                }
+        except Exception:
+            pass
+
     return corpus
 
 
@@ -70,12 +262,18 @@ def corpus_stats(corpus: dict) -> dict:
         s = r.get("_source", "unknown")
         sources[s] = sources.get(s, 0) + 1
 
+    platforms: dict[str, int] = {}
+    for r in corpus.values():
+        p = r.get("_platform", "unknown")
+        platforms[p] = platforms.get(p, 0) + 1
+
     return {
         "total_hosts": total,
         "with_version": with_version,
         "cloud_proxy": cloud_proxy,
         "top_versions": sorted(version_dist.items(), key=lambda x: -x[1])[:10],
         "by_source": sources,
+        "by_platform": platforms,
     }
 
 
@@ -441,6 +639,30 @@ def get_population_baselines(catalog: dict) -> dict[str, int]:
     return baselines
 
 
+def get_cve_version_dork(cve_id: str, catalog: dict) -> Optional[str]:
+    """
+    Return a version-specific Shodan dork for a CVE if one exists in the catalog.
+    Prefers dorks whose query contains a version number (more precise than general platform dork).
+    Returns None if no version-specific dork exists for this CVE.
+    """
+    # Find all catalog entries that reference this CVE
+    candidates = []
+    for platform, entries in catalog.items():
+        for entry in entries:
+            if cve_id in entry.get("cves", []):
+                candidates.append(entry)
+    if not candidates:
+        return None
+    # Prefer entries whose query contains a version-like number
+    version_specific = [e for e in candidates if re.search(r'\d+\.\d+', e.get("query", ""))]
+    pool = version_specific if version_specific else candidates
+    # Among those with hit counts, pick highest; otherwise first
+    with_hits = [e for e in pool if e.get("hits") is not None]
+    if with_hits:
+        return max(with_hits, key=lambda e: e["hits"])["query"]
+    return pool[0]["query"] if pool else None
+
+
 # ─── Quick test / CLI ─────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
@@ -458,8 +680,11 @@ if __name__ == "__main__":
         for v, c in stats["top_versions"]:
             print(f"  {c:3}  v{v}")
         print("\nBy source:")
-        for s, c in stats["by_source"].items():
+        for s, c in sorted(stats["by_source"].items(), key=lambda x: -x[1]):
             print(f"  {c:4}  {s}")
+        print("\nBy platform:")
+        for p, c in sorted(stats["by_platform"].items(), key=lambda x: -x[1]):
+            print(f"  {c:4}  {p}")
 
     elif cmd == "dorks":
         catalog = parse_dork_catalog()
@@ -477,7 +702,7 @@ if __name__ == "__main__":
         print(f"\nCVE cross-references: {len(cve_map)} unique CVEs")
         for cve, platforms in sorted(cve_map.items()):
             for p in platforms:
-                print(f"  {cve:<22}  {p['platform']:<25}  {p['notes'][:80]}")
+                print(f"  {cve:<22}  {p['platform']:<25}  version_dork={get_cve_version_dork(cve, catalog) or '(none)'}")
 
     elif cmd == "match":
         # Example: find all Ollama hosts < 0.1.34 (CVE-2024-37032 Probllama)
