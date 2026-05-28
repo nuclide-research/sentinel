@@ -148,6 +148,16 @@ PLATFORM_CPE = {
     "argo-workflows": ["argo-workflows", "argoproj:argo-workflows"],
 }
 
+# Manual version range overrides for CVEs where NVD is lagging or has no CPE data yet.
+# Derived from our own triage research. Format: cve_id -> [(platform, start_inc, end_excl)]
+CVE_VERSION_OVERRIDES: dict[str, list[tuple]] = {
+    # LiteLLM CVSS 9.8 — triage confirms 1.82.0–1.83.6 vulnerable, fixed in 1.83.7
+    # Source: ~/recon/litellm-cve-42208/master-cve-42208-triage.csv (104/429 hosts vulnerable)
+    "CVE-2026-42208": [("litellm", "1.82.0", "1.83.7")],
+    # Langflow — fix version TBD; using start_including only until confirmed
+    "CVE-2025-34291": [("langflow", None, None)],
+}
+
 # Fallback Shodan dorks for platforms not in TOME's catalog
 PLATFORM_DORK_FALLBACK = {
     "langflow":      'http.title:"Langflow" | http.html:"langflow" port:7860',
@@ -754,14 +764,17 @@ def log_finding(finding: SentinelFinding, cfg: Config):
 # ─── Full pipeline for one CVE ────────────────────────────────────────────────
 
 def _platform_to_corpus(platform_id: str) -> Optional[str]:
-    """Map sentinel platform ID to corpus platform name (currently only 'ollama' is surveyed)."""
+    """Map sentinel platform ID to corpus platform name.
+    Returns the platform_id directly if it exists in the corpus,
+    otherwise returns None for platforms with no surveyed data."""
+    # Explicit overrides for any naming differences
     _MAP = {
-        "ollama": "ollama",
-        "open-webui": None,    # not in corpus yet
-        "litellm": None,
-        "langflow": None,
+        "ollama":     "ollama",
+        "litellm":    "litellm",
+        "phoenix":    "phoenix",
+        "openai-compat": "openai-compat",
     }
-    return _MAP.get(platform_id)
+    return _MAP.get(platform_id, platform_id)  # try direct match by default
 
 
 
@@ -796,17 +809,29 @@ def process_cve(cve: CVERecord, cfg: Config) -> Optional[SentinelFinding]:
     print(f"    platforms: {GREEN(', '.join(matched_platforms))}{catalog_note}")
 
     # Phase 4.5: Corpus match — query our surveyed hosts for vulnerable versions
+    # Use NVD version ranges when available; fall back to CVE_VERSION_OVERRIDES
     corpus_hits: list[dict] = []
-    if _CORPUS_OK and nvd.version_ranges:
+    version_ranges_to_use = nvd.version_ranges[:]
+    if not version_ranges_to_use and cve_id in CVE_VERSION_OVERRIDES:
+        for (plat, start, end_excl) in CVE_VERSION_OVERRIDES[cve_id]:
+            version_ranges_to_use.append(
+                VersionRange(start_including=start, end_excluding=end_excl)
+            )
+
+    if _CORPUS_OK and version_ranges_to_use:
         corpus = _get_corpus()
         for platform_id in matched_platforms:
-            # Map platform_id to corpus platform name
             corpus_platform = _platform_to_corpus(platform_id)
             if not corpus_platform:
                 continue
-            for vr in nvd.version_ranges:
+            # Also try using platform_id directly as corpus platform
+            platforms_to_try = [corpus_platform] if corpus_platform else []
+            if platform_id not in platforms_to_try:
+                platforms_to_try.append(platform_id)
+            for corpus_plat in platforms_to_try:
+              for vr in version_ranges_to_use:
                 hits = query_by_version_range(
-                    corpus, corpus_platform,
+                    corpus, corpus_plat,
                     start_including=vr.start_including,
                     end_excluding=vr.end_excluding,
                     end_including=vr.end_including,

@@ -243,6 +243,33 @@ def load_corpus() -> dict[str, dict]:
         except Exception:
             pass
 
+    # SOURCE E — Generic platform state files (*-state.json in data dir)
+    # Loads any file matching <platform>-state.json that wasn't already loaded
+    # by the ollama glob. Platform name is derived from the filename stem.
+    already_loaded_patterns = {"ollama"}  # stems covered by the ollama glob
+    for state_file in sorted(DATA_DIR.glob("*-state.json")):
+        stem = state_file.stem  # e.g. "litellm-state"
+        # Skip if already covered by ollama glob
+        if any(pat in stem for pat in already_loaded_patterns):
+            continue
+        # Derive platform from filename: "litellm-state" → "litellm"
+        platform_id = stem.replace("-state", "").strip("-")
+        try:
+            data = json.loads(state_file.read_text())
+            if not isinstance(data, dict):
+                continue
+            for ip, rec in data.items():
+                if not isinstance(rec, dict):
+                    continue
+                rec = dict(rec)
+                rec.setdefault("_source", state_file.name)
+                rec.setdefault("_platform", platform_id)
+                if not rec.get("_platform"):
+                    rec["_platform"] = platform_id
+                corpus[ip] = rec
+        except Exception:
+            continue
+
     return corpus
 
 
