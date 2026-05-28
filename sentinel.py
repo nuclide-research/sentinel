@@ -2,9 +2,11 @@
 """
 sentinel — CVE-Reactive AI/ML Infrastructure Exposure Pipeline
 
-Poll CISA KEV → NVD enrichment → GitHub PoC → TOME platform match
-→ Shodan exposure count + hosts → aimap fingerprint → priority score
-→ winnow FP screen → visorlog ingest → visorscuba assess → ntfy alert
+Poll CISA KEV → NVD enrichment → GitHub PoC → platform match
+→ Corpus match (895 surveyed hosts, instant, zero API)
+→ Shodan exposure (2,625 battle-tested dorks from OSINT repo)
+→ Anomaly detection (vs April 2026 baselines)
+→ aimap fingerprint → winnow FP screen → visorlog ingest → ntfy alert
 
 Usage:
     python3 sentinel.py run              # full pipeline, once
@@ -40,6 +42,47 @@ try:
     _PW_SHODAN = True
 except ImportError:
     _PW_SHODAN = False
+
+# NuClide OSINT corpus integration
+try:
+    from corpus_query import (
+        load_corpus, query_by_version_range, corpus_stats,
+        parse_dork_catalog, get_best_dork, get_cve_platform_map,
+        get_population_baselines,
+    )
+    _CORPUS_OK = True
+except ImportError:
+    _CORPUS_OK = False
+
+# Lazy-loaded singletons — loaded once per run
+_CORPUS: Optional[dict] = None
+_DORK_CATALOG: Optional[dict] = None
+_CVE_MAP: Optional[dict] = None
+_BASELINES: Optional[dict] = None
+
+def _get_corpus() -> dict:
+    global _CORPUS
+    if _CORPUS is None:
+        _CORPUS = load_corpus() if _CORPUS_OK else {}
+    return _CORPUS
+
+def _get_dork_catalog() -> dict:
+    global _DORK_CATALOG
+    if _DORK_CATALOG is None:
+        _DORK_CATALOG = parse_dork_catalog() if _CORPUS_OK else {}
+    return _DORK_CATALOG
+
+def _get_cve_map() -> dict:
+    global _CVE_MAP
+    if _CVE_MAP is None:
+        _CVE_MAP = get_cve_platform_map(_get_dork_catalog()) if _CORPUS_OK else {}
+    return _CVE_MAP
+
+def _get_baselines() -> dict:
+    global _BASELINES
+    if _BASELINES is None:
+        _BASELINES = get_population_baselines(_get_dork_catalog()) if _CORPUS_OK else {}
+    return _BASELINES
 
 # ─── ANSI colours ─────────────────────────────────────────────────────────────
 
@@ -213,6 +256,12 @@ class CVERecord:
 
 
 @dataclass
+class VersionRange:
+    start_including: Optional[str] = None
+    end_excluding:   Optional[str] = None
+    end_including:   Optional[str] = None
+
+@dataclass
 class NVDRecord:
     cve_id: str
     cvss_score: float = 0.0
@@ -221,6 +270,7 @@ class NVDRecord:
     description: str = ""
     cpe_products: list = field(default_factory=list)
     references: list = field(default_factory=list)
+    version_ranges: list = field(default_factory=list)  # list[VersionRange]
 
 
 @dataclass
@@ -255,8 +305,14 @@ class SentinelFinding:
     date_added: str = ""
     days_since_added: int = 0
     matched_platforms: list = field(default_factory=list)
+    # Corpus: our own surveyed hosts running the vulnerable version
+    corpus_hits: list = field(default_factory=list)
+    corpus_count: int = 0
+    # Shodan: internet-wide exposure
     exposed_count: int = 0
     exposed_hosts: list = field(default_factory=list)
+    baseline_count: int = 0        # April 2026 baseline for anomaly detection
+    anomaly_pct: float = 0.0       # % change vs baseline (positive = growth)
     priority_score: float = 0.0
     priority_level: str = "P4"
     description: str = ""
@@ -336,17 +392,27 @@ def enrich_nvd(cve_id: str, cfg: Config) -> NVDRecord:
             rec.severity = cv.get("baseSeverity", cv.get("accessVector", "UNKNOWN"))
             break
 
-    # CPE products
+    # CPE products + version ranges
     cpe_names = set()
     for cfg_node in vuln.get("configurations", []):
         for node in cfg_node.get("nodes", []):
             for cpe_match in node.get("cpeMatch", []):
+                if not cpe_match.get("vulnerable", True):
+                    continue
                 uri = cpe_match.get("criteria", "")
                 parts = uri.split(":")
                 if len(parts) >= 5:
                     vendor = parts[3].lower()
                     product = parts[4].lower()
                     cpe_names.add(f"{vendor}:{product}")
+
+                vr = VersionRange(
+                    start_including=cpe_match.get("versionStartIncluding") or None,
+                    end_excluding=cpe_match.get("versionEndExcluding") or None,
+                    end_including=cpe_match.get("versionEndIncluding") or None,
+                )
+                if any([vr.start_including, vr.end_excluding, vr.end_including]):
+                    rec.version_ranges.append(vr)
     rec.cpe_products = list(cpe_names)
 
     # References
@@ -443,15 +509,24 @@ def match_platforms(cve: CVERecord, nvd: NVDRecord, cfg: Config) -> list[str]:
 def query_shodan_exposure(platform_id: str, cfg: Config) -> tuple[int, list[ExposedHost]]:
     """Return (count, hosts[:20]) using platform's strict Shodan dork.
     Tries direct API key first; falls back to Playwright authenticated session."""
-    # Try TOME catalog first, then fallback dork table
-    platforms = get_tome_platforms(cfg)
+    # 1. OSINT dork catalog (2,625 battle-tested dorks) — primary source
     dork = ""
-    for p in platforms:
-        if p.get("platform") == platform_id:
-            dork = p.get("shodan_dorks", {}).get("strict", "")
-            break
+    if _CORPUS_OK:
+        catalog = _get_dork_catalog()
+        dork = get_best_dork(platform_id, catalog) or ""
+
+    # 2. TOME catalog (17 AI/ML platforms, strict dorks)
+    if not dork:
+        platforms = get_tome_platforms(cfg)
+        for p in platforms:
+            if p.get("platform") == platform_id:
+                dork = p.get("shodan_dorks", {}).get("strict", "")
+                break
+
+    # 3. Hardcoded fallback table
     if not dork:
         dork = PLATFORM_DORK_FALLBACK.get(platform_id, "")
+
     if not dork:
         return 0, []
 
@@ -666,6 +741,28 @@ def log_finding(finding: SentinelFinding, cfg: Config):
 
 # ─── Full pipeline for one CVE ────────────────────────────────────────────────
 
+def _platform_to_corpus(platform_id: str) -> Optional[str]:
+    """Map sentinel platform ID to corpus platform name (currently only 'ollama' is surveyed)."""
+    _MAP = {
+        "ollama": "ollama",
+        "open-webui": None,    # not in corpus yet
+        "litellm": None,
+        "langflow": None,
+    }
+    return _MAP.get(platform_id)
+
+
+def _platform_to_baseline_key(platform_id: str, baselines: dict) -> str:
+    """Find the best matching baseline key for a platform_id (fuzzy slug match)."""
+    if platform_id in baselines:
+        return platform_id
+    # Try contains match
+    for key in baselines:
+        if platform_id in key or key in platform_id:
+            return key
+    return platform_id
+
+
 def process_cve(cve: CVERecord, cfg: Config) -> Optional[SentinelFinding]:
     cve_id = cve.cve_id
     print(f"\n  {CYAN(cve_id)}  {DIM(cve.vendor_project)} / {cve.product}")
@@ -678,15 +775,61 @@ def process_cve(cve: CVERecord, cfg: Config) -> Optional[SentinelFinding]:
     poc_repos = search_github_poc(cve_id, cfg)
     time.sleep(0.3)
 
-    # Platform match
+    # Platform match — CVE catalog shortcut first, then CPE inference
+    cve_map = _get_cve_map()
+    catalog_hit = cve_map.get(cve_id, [])
+    catalog_platforms = list({h["platform"] for h in catalog_hit})
+
     matched_platforms = match_platforms(cve, nvd, cfg)
+    # Merge catalog hits (these are ground-truth from our own research)
+    for cp in catalog_platforms:
+        if cp not in matched_platforms:
+            matched_platforms.append(cp)
+
     if not matched_platforms:
         print(f"    {DIM('no AI/ML platform match — skip')}")
         return None
 
-    print(f"    platforms: {GREEN(', '.join(matched_platforms))}")
+    catalog_note = f" {DIM('(catalog)')} " if catalog_platforms else ""
+    print(f"    platforms: {GREEN(', '.join(matched_platforms))}{catalog_note}")
 
-    # Priority scoring (before exposure — fast path to decide whether to probe)
+    # Phase 4.5: Corpus match — query our surveyed hosts for vulnerable versions
+    corpus_hits: list[dict] = []
+    if _CORPUS_OK and nvd.version_ranges:
+        corpus = _get_corpus()
+        for platform_id in matched_platforms:
+            # Map platform_id to corpus platform name
+            corpus_platform = _platform_to_corpus(platform_id)
+            if not corpus_platform:
+                continue
+            for vr in nvd.version_ranges:
+                hits = query_by_version_range(
+                    corpus, corpus_platform,
+                    start_including=vr.start_including,
+                    end_excluding=vr.end_excluding,
+                    end_including=vr.end_including,
+                )
+                for h in hits:
+                    h["platform"] = platform_id
+                corpus_hits.extend(hits)
+        # Deduplicate by IP
+        seen_ips = set()
+        uniq_hits = []
+        for h in corpus_hits:
+            if h["ip"] not in seen_ips:
+                seen_ips.add(h["ip"])
+                uniq_hits.append(h)
+        corpus_hits = uniq_hits
+
+    if corpus_hits:
+        print(f"    {BOLD('corpus')} {RED(str(len(corpus_hits)))} of our surveyed hosts "
+              f"running vulnerable version")
+        for h in corpus_hits[:5]:
+            print(f"      {h['ip']:<16}  v{h['version']:<12}  {h['org']}")
+        if len(corpus_hits) > 5:
+            print(f"      {DIM(f'... and {len(corpus_hits)-5} more')}")
+
+    # Priority scoring
     days_since = 0
     try:
         added = datetime.fromisoformat(cve.date_added).replace(tzinfo=timezone.utc)
@@ -698,16 +841,34 @@ def process_cve(cve: CVERecord, cfg: Config) -> Optional[SentinelFinding]:
     print(f"    CVSS {nvd.cvss_score} | PoC {'yes' if poc_repos else 'no'} | "
           f"score {priority_score:.3f} → {badge(priority_level)}")
 
-    # Shodan exposure
+    # Shodan exposure — use battle-tested dork catalog as primary source
     total_exposed = 0
     all_hosts: list[ExposedHost] = []
+    baselines = _get_baselines()
+    total_baseline = 0
+
     for platform_id in matched_platforms:
         print(f"    Shodan  {DIM(platform_id)}", end="", flush=True)
         count, hosts = query_shodan_exposure(platform_id, cfg)
         total_exposed += count
         all_hosts.extend(hosts)
-        print(f"  {count:,} hosts")
+
+        # Anomaly detection vs April 2026 baseline
+        baseline_key = _platform_to_baseline_key(platform_id, baselines)
+        baseline = baselines.get(baseline_key, 0)
+        total_baseline += baseline
+        anomaly_str = ""
+        if baseline > 0 and count > 0:
+            pct = (count - baseline) / baseline * 100
+            if abs(pct) >= 10:
+                anomaly_str = f"  {YELLOW(f'Δ{pct:+.0f}% vs baseline')}"
+
+        print(f"  {count:,} hosts{anomaly_str}")
         time.sleep(1)
+
+    anomaly_pct = 0.0
+    if total_baseline > 0 and total_exposed > 0:
+        anomaly_pct = (total_exposed - total_baseline) / total_baseline * 100
 
     # Build finding
     finding = SentinelFinding(
@@ -722,8 +883,12 @@ def process_cve(cve: CVERecord, cfg: Config) -> Optional[SentinelFinding]:
         date_added=cve.date_added,
         days_since_added=days_since,
         matched_platforms=matched_platforms,
+        corpus_hits=corpus_hits,
+        corpus_count=len(corpus_hits),
         exposed_count=total_exposed,
         exposed_hosts=[asdict(h) for h in all_hosts[:20]],
+        baseline_count=total_baseline,
+        anomaly_pct=anomaly_pct,
         priority_score=priority_score,
         priority_level=priority_level,
         description=nvd.description[:500],
@@ -767,6 +932,14 @@ def cmd_run(args, cfg: Config):
     print(DIM(f"  tools: " + "  ".join(
         f"{t}={'ok' if v else 'missing'}" for t, v in TOOLS.items()
     )))
+    if _CORPUS_OK:
+        corpus = _get_corpus()
+        stats = corpus_stats(corpus)
+        catalog = _get_dork_catalog()
+        dork_count = sum(len(v) for v in catalog.values())
+        print(DIM(f"  corpus: {stats['total_hosts']} surveyed hosts  "
+                  f"({stats['with_version']} with version)  "
+                  f"|  dorks: {dork_count} entries across {len(catalog)} platforms"))
     if cfg.dry_run:
         print(f"  {YELLOW('DRY RUN')} — no active probes, no alerts")
 
@@ -794,9 +967,13 @@ def cmd_run(args, cfg: Config):
         print(f"\n{BOLD('Run complete')}")
         print(f"  {len(new_cves)} CVEs processed | {len(ai_hits)} AI/ML matches")
         for f in sorted(ai_hits, key=lambda x: x.priority_score, reverse=True):
+            corpus_str = f"  {RED(str(f.corpus_count)+'c own')}" if f.corpus_count else ""
+            anomaly_str = (f"  {YELLOW(f'Δ{f.anomaly_pct:+.0f}%')}"
+                           if abs(f.anomaly_pct) >= 10 else "")
             print(f"  {badge(f.priority_level)}  {f.cve_id}  "
                   f"{', '.join(f.matched_platforms)}  "
-                  f"{f.exposed_count:,} exposed  CVSS {f.cvss_score}")
+                  f"{f.exposed_count:,} shodan{corpus_str}{anomaly_str}  "
+                  f"CVSS {f.cvss_score}")
 
         state["runs"].append({
             "timestamp": run_start.isoformat(),
@@ -834,11 +1011,13 @@ def cmd_status(args, cfg: Config):
                 pass
 
     for fn in sorted(findings, key=lambda x: x.get("priority_score", 0), reverse=True)[:20]:
+        corpus_str = f"  {RED(str(fn.get('corpus_count',0))+'c')}" if fn.get("corpus_count") else ""
         print(f"  {badge(fn.get('priority_level','P4'))}  "
               f"{fn.get('cve_id','?')}  "
               f"{','.join(fn.get('matched_platforms',[])):<20}  "
               f"CVSS {fn.get('cvss_score',0):<5}  "
-              f"{fn.get('exposed_count',0):>6,} exposed")
+              f"{fn.get('exposed_count',0):>6,} shodan"
+              f"{corpus_str}")
 
 
 def cmd_reset(args, cfg: Config):
