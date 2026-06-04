@@ -1,136 +1,131 @@
 # sentinel
 
-CVE-reactive exposure pipeline for AI/ML infrastructure. A new CISA KEV entry
-comes in, and sentinel answers one question: do we already see it on the
-internet, and do we already see it in our own surveyed hosts.
+CVE-reactive exposure pipeline for AI/ML infrastructure. Polls CISA KEV, enriches each new entry from NVD, finds public PoC repos, checks whether the CVE touches a tracked AI/ML platform, cross-references the affected version range against a local corpus of surveyed hosts, counts live Shodan exposure with anomaly detection against April 2026 baselines, scores priority, then routes results to a findings ledger and a phone notification.
 
-A KEV listing tells you a vulnerability is being exploited. It does not tell you
-whether the affected platform is one you track, how many instances are exposed
-right now, or whether any of them are hosts you already fingerprinted. sentinel
-chains those answers together. It polls the KEV feed, enriches each CVE from NVD,
-looks for public PoC, decides whether the CVE touches an AI/ML platform, cross
-references the affected version range against a local corpus of surveyed hosts,
-counts live Shodan exposure, scores priority, and routes the result to a findings
-ledger and a phone notification. Everything past the public feeds is optional and
-degrades gracefully: with nothing but `requests` installed it still polls KEV,
-enriches NVD, finds PoC, and scores.
+A KEV listing tells you a vulnerability is being exploited. It does not tell you whether the affected platform is one you track, how many instances are exposed now, or whether any are hosts you already fingerprinted. sentinel chains those answers together in one pass, per new CVE. Everything past the public feeds degrades gracefully: with only `requests` installed, it still polls KEV, enriches NVD, finds PoC, and scores. Each integration layer is optional and its absence does not block a run.
 
 ## Install
 
-```
+```bash
 git clone https://github.com/nuclide-research/sentinel
 cd sentinel
 pip install requests
 ```
 
-Python 3.9+ (generic type subscripts like `dict[str, dict]` are used in
-annotations). `requests` is the only hard requirement; sentinel exits with a
-message if it is missing.
+Python 3.9+. `requests` is the only hard requirement; sentinel exits with a message if it is missing.
 
-Optional:
+Optional (for Shodan via authenticated browser session when the API key is absent or expired):
 
-```
-pip install playwright           # Shodan via authenticated browser session
+```bash
+pip install playwright
 python -m playwright install chromium
 ```
 
-`playwright` is only needed when the direct Shodan API key path is unavailable or
-expired. Without it, sentinel uses the API key path alone.
-
-## Requires (optional integrations)
-
-These are discovered at runtime and skipped if absent. None block a run.
-
-| Integration | Purpose | Where sentinel looks |
-| --- | --- | --- |
-| `aimap` | Fingerprint top P1/P2 exposed hosts | `PATH`, `~/go/bin`, `~/Tools/`, `~/<name>/`, `~/.local/bin` |
-| `winnow` | False-positive screen on aimap output | `~/winnow/winnow.py` |
-| `visorlog` | Ingest exposed hosts into the findings ledger | same search paths as `aimap` |
-| `tome` | Source of strict per-platform Shodan dorks | same search paths as `aimap` |
-| `visorscuba`, `jaxen`, `visorsd` | Discovered but not invoked by the current pipeline | same search paths |
-| OSINT corpus | Version-range match against surveyed hosts, the dork catalog, and live baselines | `~/AI-LLM-Infrastructure-OSINT/` (data, evidence, working, `shodan/queries`, `visorlog.db`) |
-
-The corpus integration lives in `corpus_query.py` and is imported on a guarded
-basis. If `~/AI-LLM-Infrastructure-OSINT/` is not present, corpus matching,
-catalog dorks, and anomaly baselines are simply empty and sentinel falls back to a
-small built-in dork table.
-
 ## Configure
 
-All configuration is environment variables or a JSON file. None are required to
-run, but Shodan exposure and ntfy alerts need their respective values.
+All configuration is environment variables or a JSON file at `~/.config/sentinel/config.json`. None are required to run.
 
-| Variable | Default | Used for |
-| --- | --- | --- |
-| `SHODAN_API_KEY` | (unset) | Shodan host count and search |
+| Variable | Default | Purpose |
+|----------|---------|---------|
+| `SHODAN_API_KEY` | (unset) | Shodan host count + search |
 | `SENTINEL_NTFY_TOPIC` | `nuclide-sentinel` | ntfy alert topic |
-| `NVD_API_KEY` | (unset) | Higher NVD rate limit |
+| `NVD_API_KEY` | (unset) | Higher NVD rate limit (50 req/30s without key) |
 | `GITHUB_TOKEN` | (unset) | Higher GitHub search rate limit |
 
-JSON overrides load from `~/.config/sentinel/config.json` (keys match the `Config`
-fields). If `SHODAN_API_KEY` is unset, sentinel also reads
-`~/.config/nuclide/shodan.key` then `~/.config/shodan/api_key`.
+If `SHODAN_API_KEY` is unset, sentinel also reads `~/.config/nuclide/shodan.key` then `~/.config/shodan/api_key`. When neither API key path is set, Shodan exposure queries run via Playwright authenticated browser session (`shodan_playwright.py`), falling back to empty if Playwright is also unavailable.
 
-State and logs are written under `~/.local/share/sentinel/` (`state.json`,
-`pharos-queue.ndjson`, and dated `logs/sentinel-YYYY-MM-DD.ndjson`).
+State and logs write under `~/.local/share/sentinel/`: `state.json`, `pharos-queue.ndjson`, and dated `logs/sentinel-YYYY-MM-DD.ndjson`.
 
 ## Usage
 
 ```
-python3 sentinel.py run                # full pipeline, once
-python3 sentinel.py run --loop         # repeat every 6h
-python3 sentinel.py run --dry-run      # no active probes, no ledger writes, no alerts
-python3 sentinel.py status             # processed-CVE count + recent findings
-python3 sentinel.py reset              # clear processed-CVE state
+python3 sentinel.py run               # full pipeline, once
+python3 sentinel.py run --loop        # repeat every 6 hours
+python3 sentinel.py run --dry-run     # no active probes, no ledger writes, no alerts
+python3 sentinel.py status            # processed-CVE count + recent findings
+python3 sentinel.py reset             # clear processed-CVE state
 ```
 
-`run` processes only CVEs not already seen (state is checkpointed after each CVE,
-so an interrupted run resumes). The pipeline per new CVE:
+`run` processes only CVEs not already seen. State is checkpointed after each CVE, so an interrupted run resumes cleanly.
 
-1. CISA KEV poll, filtered to the last 30 days.
-2. NVD enrichment: CVSS, description, CPE products, affected version ranges.
-3. GitHub PoC search (top 5 by stars).
-4. Platform match: CISA vendor/product and NVD CPE against a registry of AI/ML
-   platforms (Ollama, vLLM, MLflow, ChromaDB, Qdrant, Weaviate, Langflow, Dify,
-   Flowise, LiteLLM, n8n, and others). No AI/ML match means the CVE is skipped.
-5. Corpus match: surveyed hosts running a version inside the affected range.
-6. Shodan exposure count plus a sample of hosts, with anomaly flagging against
-   live baselines.
-7. Priority score (CVSS, PoC presence, KEV membership, recency) to P1 through P4.
-8. For P1/P2 with live hosts: aimap fingerprint of the top hosts, then a winnow
-   false-positive screen.
-9. visorlog ingest of exposed hosts (skipped under `--dry-run`).
-10. ntfy alert if the priority clears the configured floor (default P2).
+## Pipeline per new CVE (10 steps)
 
-`--dry-run` skips every active or destructive step: no aimap probes, no visorlog
-writes, no ntfy, no pharos queue entries. The read-only feed lookups still run.
+1. **CISA KEV poll** - fetch the KEV catalog, filter to the last 30 days.
+2. **NVD enrichment** - CVSS score and vector, English description, CPE products, affected version ranges.
+3. **GitHub PoC search** - top 5 repos by stars for the CVE ID.
+4. **Platform match** - CISA vendor/product fields and NVD CPE strings matched against a registry of 30+ AI/ML platforms (Ollama, vLLM, MLflow, ChromaDB, Qdrant, Weaviate, Langflow, Dify, Flowise, LiteLLM, n8n, and others). No AI/ML match means the CVE is skipped.
+5. **Corpus match** - query surveyed hosts for versions inside the NVD-reported (or manually overridden) affected range. Reports which of our fingerprinted hosts are running a vulnerable version.
+6. **Shodan exposure** - count live exposed instances using the OSINT dork catalog (primary), the TOME per-platform strict dorks (fallback), or a built-in dork table (last resort). Anomaly detection flags a large change vs April 2026 baselines.
+7. **Priority score** - four-factor formula: CVSS (0.25), PoC presence (0.25), KEV membership (0.15), recency decay (0.15). Produces P1 through P4.
+8. **aimap fingerprint** - for P1/P2 with live hosts: fingerprint the top 5 exposed hosts with aimap, then run a winnow false-positive screen on the output.
+9. **visorlog ingest** - write exposed hosts into the findings ledger (skipped under `--dry-run`).
+10. **ntfy alert** - push a phone notification if the priority clears the configured floor (default P2; skipped under `--dry-run`).
 
-`status` prints the processed-CVE and run counts, then the highest-priority
-findings from the most recent daily log.
+P1/P2 corpus hits also write an entry to `pharos-queue.ndjson` for downstream autonomous follow-up by pharos.
 
-### corpus_query helper
+## Optional integrations
 
-`corpus_query.py` is importable by sentinel and also runs standalone for
-inspecting the corpus and dork catalog:
+All integrations are discovered at runtime. A missing integration causes its step to skip; the rest of the pipeline continues.
+
+| Integration | Purpose | Location sentinel searches |
+|-------------|---------|---------------------------|
+| `aimap` | Fingerprint top P1/P2 exposed hosts | PATH, `~/go/bin`, `~/Tools/`, `~/.local/bin` |
+| `winnow` | False-positive screen on aimap output | `~/winnow/winnow.py` |
+| `visorlog` | Ingest exposed hosts into findings ledger | same paths as aimap |
+| `tome` | Source of per-platform strict Shodan dorks | same paths as aimap |
+| OSINT corpus | Version-range match, dork catalog, live baselines | `~/AI-LLM-Infrastructure-OSINT/` |
+
+The corpus integration (`corpus_query.py`) reads surveyed host records, a dork catalog, and live Shodan baselines from the local NuClide OSINT repository layout. Without that directory, corpus matching, catalog dorks, and anomaly baselines are empty and sentinel falls back to the built-in dork table.
+
+### corpus_query standalone
+
+`corpus_query.py` also runs standalone for inspecting the corpus and dork catalog:
 
 ```
-python3 corpus_query.py stats          # corpus host/version/source/platform summary (default)
-python3 corpus_query.py dorks          # dork catalog size + top platforms by hit count
-python3 corpus_query.py cves           # CVE cross-references found in the catalog
-python3 corpus_query.py match          # example: Ollama < 0.1.34 hosts in corpus
+python3 corpus_query.py stats    # corpus host/version/source/platform summary
+python3 corpus_query.py dorks    # dork catalog size + top platforms by hit count
+python3 corpus_query.py cves     # CVE cross-references in the catalog
+python3 corpus_query.py match    # example: Ollama < 0.1.34 hosts in corpus
 ```
 
-These require `~/AI-LLM-Infrastructure-OSINT/` to be present; without it they
-report empty results.
+Requires `~/AI-LLM-Infrastructure-OSINT/` to be present; without it these report empty.
+
+## Example output
+
+```
+sentinel  CVE-Reactive AI/ML Exposure Pipeline
+  tools: aimap=ok  winnow=ok  visorlog=ok  tome=missing  ...
+  corpus: 895 surveyed hosts  (743 with version)  |  dorks: 2625 entries across 48 platforms
+
+──────────────────────────────────────────────────────────────
+  2026-06-03T14:00:00Z
+
+Phase 1  CISA KEV poll (lookback 30d)
+  ok  12 CVEs in last 30d (catalog: 1,247 total)
+  4 new CVEs to process (8 already seen)
+
+  CVE-2026-42208  berriai / litellm
+    platforms: litellm (catalog)
+    corpus 3 of our surveyed hosts running vulnerable version
+      192.0.2.10       v1.82.4       Hetzner Online GmbH
+      192.0.2.11       v1.83.1       OVH SAS
+    CVSS 9.8 | PoC yes | score 0.874 → [P1]
+    Shodan  litellm  57,454 hosts  Δ+12% vs baseline
+    aimap fingerprinting top 5 hosts...
+
+Run complete
+  4 CVEs processed | 1 AI/ML matches
+  [P1]  CVE-2026-42208  litellm  57,454 shodan  3c own  CVSS 9.8
+```
 
 ## Notes
 
-The aimap, visorlog, and Shodan stages reach out to live hosts and external
-services. Run them against your own or authorized infrastructure only. `--dry-run`
-exists so you can exercise the feed and scoring logic without touching any host.
-The corpus, dork catalog, and baseline integrations are tied to the local NuClide
-OSINT repository layout and are inert outside it.
+The aimap and Shodan exposure stages reach out to live hosts and external services. Run them against your own or authorized infrastructure only. `--dry-run` exercises the feed and scoring logic without touching any host, writing any ledger entry, or sending any alert.
+
+## What sentinel is not
+
+sentinel is not an always-on daemon. It runs once or in a 6-hour loop under `--loop`. It does not monitor network traffic or parse logs. Its corpus, dork catalog, and baseline integrations are tied to the local NuClide OSINT repository layout and are inert outside it. It does not replace aimap or visorlog; it drives them.
 
 ## License
 
-MIT. Part of the NuClide toolchain.
+MIT. Part of the NuClide toolchain. Contact: [nuclide-research.com](https://nuclide-research.com)
